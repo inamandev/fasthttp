@@ -20,6 +20,158 @@ import (
 	"github.com/valyala/fasthttp/fasthttputil"
 )
 
+func TestCloseIdleConnections(t *testing.T) {
+	ln := fasthttputil.NewInmemoryListener()
+
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+		},
+	}
+	go func() {
+		if err := s.Serve(ln); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	c := &Client{
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+	}
+
+	if _, _, err := c.Get(nil, "http://google.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	connsLen := func() int {
+		c.mLock.Lock()
+		defer c.mLock.Unlock()
+
+		if _, ok := c.m["google.com"]; !ok {
+			return 0
+		}
+
+		c.m["google.com"].connsLock.Lock()
+		defer c.m["google.com"].connsLock.Unlock()
+
+		return len(c.m["google.com"].conns)
+	}
+
+	if conns := connsLen(); conns > 1 {
+		t.Errorf("expected 1 conns got %d", conns)
+	}
+
+	c.CloseIdleConnections()
+
+	if conns := connsLen(); conns > 0 {
+		t.Errorf("expected 0 conns got %d", conns)
+	}
+}
+
+func TestPipelineClientSetUserAgent(t *testing.T) {
+	t.Parallel()
+
+	testPipelineClientSetUserAgent(t, 0)
+}
+
+func TestPipelineClientSetUserAgentTimeout(t *testing.T) {
+	t.Parallel()
+
+	testPipelineClientSetUserAgent(t, time.Second)
+}
+
+func testPipelineClientSetUserAgent(t *testing.T, timeout time.Duration) {
+	ln := fasthttputil.NewInmemoryListener()
+
+	userAgentSeen := ""
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			userAgentSeen = string(ctx.UserAgent())
+		},
+	}
+	go s.Serve(ln) //nolint:errcheck
+
+	userAgent := "I'm not fasthttp"
+	c := &HostClient{
+		Name: userAgent,
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+	}
+	req := AcquireRequest()
+	res := AcquireResponse()
+
+	req.SetRequestURI("http://example.com")
+
+	var err error
+	if timeout <= 0 {
+		err = c.Do(req, res)
+	} else {
+		err = c.DoTimeout(req, res, timeout)
+	}
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if userAgentSeen != userAgent {
+		t.Fatalf("User-Agent defers %q != %q", userAgentSeen, userAgent)
+	}
+}
+
+func TestPipelineClientIssue832(t *testing.T) {
+	t.Parallel()
+
+	ln := fasthttputil.NewInmemoryListener()
+
+	req := AcquireRequest()
+	defer ReleaseRequest(req)
+	req.SetHost("example.com")
+
+	res := AcquireResponse()
+	defer ReleaseResponse(res)
+
+	client := PipelineClient{
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+		ReadTimeout: time.Millisecond * 10,
+		Logger:      &testLogger{}, // Ignore log output.
+	}
+
+	attempts := 10
+	go func() {
+		for i := 0; i < attempts; i++ {
+			c, err := ln.Accept()
+			if err != nil {
+				t.Error(err)
+			}
+			if c != nil {
+				go func() {
+					time.Sleep(time.Millisecond * 50)
+					c.Close()
+				}()
+			}
+		}
+	}()
+
+	done := make(chan int)
+	go func() {
+		defer close(done)
+
+		for i := 0; i < attempts; i++ {
+			if err := client.Do(req, res); err == nil {
+				t.Error("error expected")
+			}
+		}
+	}()
+
+	select {
+	case <-time.After(time.Second):
+		t.Fatal("PipelineClient did not restart worker")
+	case <-done:
+	}
+}
+
 func TestClientInvalidURI(t *testing.T) {
 	t.Parallel()
 
@@ -30,7 +182,7 @@ func TestClientInvalidURI(t *testing.T) {
 			atomic.AddInt64(&requests, 1)
 		},
 	}
-	go s.Serve(ln)
+	go s.Serve(ln) //nolint:errcheck
 	c := &Client{
 		Dial: func(addr string) (net.Conn, error) {
 			return ln.Dial()
@@ -59,10 +211,10 @@ func TestClientGetWithBody(t *testing.T) {
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
 			body := ctx.Request.Body()
-			ctx.Write(body)
+			ctx.Write(body) //nolint:errcheck
 		},
 	}
-	go s.Serve(ln)
+	go s.Serve(ln) //nolint:errcheck
 	c := &Client{
 		Dial: func(addr string) (net.Conn, error) {
 			return ln.Dial()
@@ -153,6 +305,34 @@ func TestClientNilResp(t *testing.T) {
 	}
 }
 
+func TestPipelineClientNilResp(t *testing.T) {
+	t.Parallel()
+
+	ln := fasthttputil.NewInmemoryListener()
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+		},
+	}
+	go s.Serve(ln) //nolint:errcheck
+	c := &PipelineClient{
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+	}
+	req := AcquireRequest()
+	req.Header.SetMethod(MethodGet)
+	req.SetRequestURI("http://example.com")
+	if err := c.Do(req, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DoTimeout(req, nil, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DoDeadline(req, nil, time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientParseConn(t *testing.T) {
 	t.Parallel()
 
@@ -185,7 +365,6 @@ func TestClientParseConn(t *testing.T) {
 	if !regexp.MustCompile(`^127\.0\.0\.1:[0-9]{4,5}$`).MatchString(res.LocalAddr().String()) {
 		t.Fatalf("res LocalAddr addr match fail: %s, hope match: %s", res.LocalAddr().String(), "^127.0.0.1:[0-9]{4,5}$")
 	}
-
 }
 
 func TestClientPostArgs(t *testing.T) {
@@ -267,7 +446,6 @@ func TestClientRedirectSameSchema(t *testing.T) {
 		t.Fatalf("HostClient error code response %d", statusCode)
 		return
 	}
-
 }
 
 func TestClientRedirectClientChangingSchemaHttp2Https(t *testing.T) {
@@ -347,12 +525,16 @@ func testClientRedirectListener(t *testing.T, isTLS bool) net.Listener {
 	var tlsConfig *tls.Config
 
 	if isTLS {
-		certFile := "./ssl-cert-snakeoil.pem"
-		keyFile := "./ssl-cert-snakeoil.key"
-		cert, err1 := tls.LoadX509KeyPair(certFile, keyFile)
-		if err1 != nil {
-			t.Fatalf("Cannot load TLS certificate: %s", err1)
+		certData, keyData, kerr := GenerateTestCertificate("localhost")
+		if kerr != nil {
+			t.Fatal(kerr)
 		}
+
+		cert, kerr := tls.X509KeyPair(certData, keyData)
+		if kerr != nil {
+			t.Fatal(kerr)
+		}
+
 		tlsConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
@@ -824,6 +1006,76 @@ func testPipelineClientDo(t *testing.T, c *PipelineClient) {
 	}
 	ReleaseRequest(req)
 	ReleaseResponse(resp)
+}
+
+func TestPipelineClientDoDisableHeaderNamesNormalizing(t *testing.T) {
+	t.Parallel()
+
+	testPipelineClientDisableHeaderNamesNormalizing(t, 0)
+}
+
+func TestPipelineClientDoTimeoutDisableHeaderNamesNormalizing(t *testing.T) {
+	t.Parallel()
+
+	testPipelineClientDisableHeaderNamesNormalizing(t, time.Second)
+}
+
+func testPipelineClientDisableHeaderNamesNormalizing(t *testing.T, timeout time.Duration) {
+	ln := fasthttputil.NewInmemoryListener()
+
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			ctx.Response.Header.Set("foo-BAR", "baz")
+		},
+		DisableHeaderNamesNormalizing: true,
+	}
+
+	serverStopCh := make(chan struct{})
+	go func() {
+		if err := s.Serve(ln); err != nil {
+			t.Errorf("unexpected error: %s", err)
+		}
+		close(serverStopCh)
+	}()
+
+	c := &PipelineClient{
+		Dial: func(addr string) (net.Conn, error) {
+			return ln.Dial()
+		},
+		DisableHeaderNamesNormalizing: true,
+	}
+
+	var req Request
+	req.SetRequestURI("http://aaaai.com/bsdf?sddfsd")
+	var resp Response
+	for i := 0; i < 5; i++ {
+		if timeout > 0 {
+			if err := c.DoTimeout(&req, &resp, timeout); err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+		} else {
+			if err := c.Do(&req, &resp); err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+		}
+		hv := resp.Header.Peek("foo-BAR")
+		if string(hv) != "baz" {
+			t.Fatalf("unexpected header value: %q. Expecting %q", hv, "baz")
+		}
+		hv = resp.Header.Peek("Foo-Bar")
+		if len(hv) > 0 {
+			t.Fatalf("unexpected non-empty header value %q", hv)
+		}
+	}
+
+	if err := ln.Close(); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	select {
+	case <-serverStopCh:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout")
+	}
 }
 
 func TestClientDoTimeoutDisableHeaderNamesNormalizing(t *testing.T) {
@@ -2149,12 +2401,16 @@ func startEchoServerExt(t *testing.T, network, addr string, isTLS bool) *testEch
 	var ln net.Listener
 	var err error
 	if isTLS {
-		certFile := "./ssl-cert-snakeoil.pem"
-		keyFile := "./ssl-cert-snakeoil.key"
-		cert, err1 := tls.LoadX509KeyPair(certFile, keyFile)
-		if err1 != nil {
-			t.Fatalf("Cannot load TLS certificate: %s", err1)
+		certData, keyData, kerr := GenerateTestCertificate("localhost")
+		if kerr != nil {
+			t.Fatal(kerr)
 		}
+
+		cert, kerr := tls.X509KeyPair(certData, keyData)
+		if kerr != nil {
+			t.Fatal(kerr)
+		}
+
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
@@ -2371,7 +2627,6 @@ func TestHostClientMaxConnWaitTimeoutError(t *testing.T) {
 					t.Errorf("unexpected body %q. Expecting %q", body, "abcd")
 				}
 			}
-
 		}()
 	}
 	wg.Wait()
@@ -2464,7 +2719,6 @@ func TestHostClientMaxConnWaitTimeoutWithEarlierDeadline(t *testing.T) {
 					t.Errorf("unexpected body %q. Expecting %q", body, "abcd")
 				}
 			}
-
 		}()
 	}
 	wg.Wait()
