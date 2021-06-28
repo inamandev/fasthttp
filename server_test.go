@@ -948,7 +948,7 @@ func TestServerTLSReadTimeout(t *testing.T) {
 	ln := fasthttputil.NewInmemoryListener()
 
 	s := &Server{
-		ReadTimeout: time.Millisecond * 100,
+		ReadTimeout: time.Millisecond * 500,
 		Logger:      &testLogger{}, // Ignore log output.
 		Handler: func(ctx *RequestCtx) {
 		},
@@ -986,7 +986,7 @@ func TestServerTLSReadTimeout(t *testing.T) {
 
 	select {
 	case err = <-r:
-	case <-time.After(time.Millisecond * 500):
+	case <-time.After(time.Second):
 	}
 
 	if err == nil {
@@ -1108,7 +1108,6 @@ Host: asbd
 Connection: close
 
 `
-
 		ln := fasthttputil.NewInmemoryListener()
 
 		s := &Server{
@@ -1552,6 +1551,8 @@ func TestServerHTTP10ConnectionClose(t *testing.T) {
 }
 
 func TestRequestCtxFormValue(t *testing.T) {
+	t.Parallel()
+
 	var ctx RequestCtx
 	var req Request
 	req.SetRequestURI("/foo/bar?baz=123&aaa=bbb")
@@ -1610,6 +1611,8 @@ func TestRequestCtxUserValue(t *testing.T) {
 }
 
 func TestServerHeadRequest(t *testing.T) {
+	t.Parallel()
+
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
 			fmt.Fprintf(ctx, "Request method is %q", ctx.Method())
@@ -1763,7 +1766,7 @@ func TestServerContinueHandler(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Unexpected error from serveConn: %s", err)
 			}
-		case <-time.After(100 * time.Millisecond):
+		case <-time.After(200 * time.Millisecond):
 			t.Fatal("timeout")
 		}
 
@@ -2335,6 +2338,8 @@ func TestRequestCtxNoHijackNoResponse(t *testing.T) {
 }
 
 func TestRequestCtxInit(t *testing.T) {
+	// This test can't run parallel as it modifies globalConnID.
+
 	var ctx RequestCtx
 	var logger testLogger
 	globalConnID = 0x123456
@@ -2872,6 +2877,8 @@ func TestServerEmptyResponse(t *testing.T) {
 }
 
 func TestServerLogger(t *testing.T) {
+	// This test can't run parallel as it modifies globalConnID.
+
 	cl := &testLogger{}
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
@@ -3119,6 +3126,8 @@ func TestServeConnSingleRequest(t *testing.T) {
 }
 
 func TestServeConnMultiRequests(t *testing.T) {
+	t.Parallel()
+
 	s := &Server{
 		Handler: func(ctx *RequestCtx) {
 			h := &ctx.Request.Header
@@ -3279,7 +3288,7 @@ func TestShutdownReuse(t *testing.T) {
 		Handler: func(ctx *RequestCtx) {
 			ctx.Success("aaa/bbb", []byte("real response"))
 		},
-		ReadTimeout: time.Second,
+		ReadTimeout: time.Millisecond * 100,
 		Logger:      &testLogger{}, // Ignore log output.
 	}
 	go func() {
@@ -3578,6 +3587,47 @@ func TestStreamRequestBodyExceedMaxSize(t *testing.T) {
 	}
 }
 
+func TestStreamBodyReqestContentLength(t *testing.T) {
+	t.Parallel()
+	content := strings.Repeat("1", 1<<15) // 32K
+	contentLength := len(content)
+
+	s := &Server{
+		Handler: func(ctx *RequestCtx) {
+			realContentLength := ctx.Request.Header.ContentLength()
+			if realContentLength != contentLength {
+				t.Fatal("incorrect content length")
+			}
+		},
+		MaxRequestBodySize: 1 * 1024 * 1024, // 1M
+		StreamRequestBody:  true,
+	}
+
+	pipe := fasthttputil.NewPipeConns()
+	cc, sc := pipe.Conn1(), pipe.Conn2()
+	if _, err := cc.Write([]byte(fmt.Sprintf("POST /foo2 HTTP/1.1\r\nHost: aaa.com\r\nContent-Length: %d\r\nContent-Type: aa\r\n\r\n%s", contentLength, content))); err != nil {
+		t.Fatal(err)
+	}
+
+	ch := make(chan error)
+	go func() {
+		ch <- s.ServeConn(sc)
+	}()
+
+	if err := sc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-ch:
+		if err == nil || err.Error() != "connection closed" { // fasthttputil.errConnectionClosed is private so do a string match.
+			t.Fatalf("Unexpected error from serveConn: %s", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("test timeout")
+	}
+}
+
 func checkReader(t *testing.T, r io.Reader, expected string) {
 	b := make([]byte, len(expected))
 	if _, err := io.ReadFull(r, b); err != nil {
@@ -3696,6 +3746,8 @@ func TestMaxWriteTimeoutPerRequest(t *testing.T) {
 }
 
 func TestIncompleteBodyReturnsUnexpectedEOF(t *testing.T) {
+	t.Parallel()
+
 	rw := &readWriter{}
 	rw.r.WriteString("POST /foo HTTP/1.1\r\nHost: google.com\r\nContent-Length: 5\r\n\r\n123")
 	s := &Server{
